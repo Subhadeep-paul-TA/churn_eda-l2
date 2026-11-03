@@ -1,0 +1,22 @@
+{
+  "permissions": {
+    "deny": [
+      "Read(./PLAN.md)",
+      "Read(./*.docx)",
+      "Read(./*.xlsx)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "grep -qiE 'PLAN\\.md|\\.docx|\\.xlsx' && { echo 'Blocked: PLAN.md and the .docx/.xlsx reference files are off-limits in this project.' >&2; exit 2; }; exit 0"
+          }
+        ]
+      }
+    ]
+  }
+}
