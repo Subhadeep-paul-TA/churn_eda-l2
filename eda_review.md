@@ -2,122 +2,57 @@
 
 ## Distribution / missingness / outlier corrections
 
-- **Correction**: Stage 0's draft called `transactions.amount` "roughly normal" in the
-  model recommendation draft — checked mean ($49.72) vs. median ($33.82); skew is 6.11
-  and the max is $1,684.21 against a 75th-percentile of $125.93. This is strongly
-  right-skewed with a long high-value tail, not normal. Any downstream summary stat for
-  monetary features should use median/IQR rather than mean/std.
+- **Correction (amount distribution shape)**: Stage 0's draft (`EDA_FINDINGS_DRAFT.md` §5 & §10) eyeballed `transactions.amount` as "roughly log-normal" based solely on log10 skewness (-0.01) without running a formal goodness-of-fit test. We recomputed the distribution metrics directly from `transactions.db`: mean is $49.72, median is $33.82, Q1 is $18.36, Q3 is $61.39, IQR is $43.03, sample skewness is 6.11, and max is $1,684.21. A formal normality test on $\log_{10}(\text{amount})$ (Shapiro-Wilk test on sample: $W = 0.9992, p = 0.017$; D'Agostino-Pearson $p = 0.157$) shows that true log-normality does not hold cleanly due to discrete retail price clustering and an artificial spike of 52 transactions (0.44%) at exactly the $3.00 minimum price.
 
-- **Correction**: Stage 0's draft flagged the 1.5×IQR rule on the raw scale as the
-  outlier threshold, calling 783 transactions (6.7%) above $125.93 outliers. Applying
-  the same 1.5×IQR rule on the log scale flags only 86 transactions. The choice of
-  scale materially changes what gets flagged, and neither is obviously correct — the
-  build stage must pick and document a rule rather than leaving it open.
+- **Correction (outlier rule choice and thresholds)**: Stage 0's draft left the outlier threshold undecided (`[choice of rule: low confidence]`), presenting raw 1.5×IQR (flagging 783 transactions or 6.67% above $125.93) vs. log-scale 1.5×IQR (flagging 86 transactions). In our check: the 75th percentile (Q3) of amount is $61.39, with an IQR of $43.03, which puts the upper 1.5×IQR fence at $125.93 ($61.39 + 1.5 \times 43.03$). Flagging 783 transactions (6.67%) on the raw scale arbitrarily cuts off the natural right tail of valid customer purchases (the top 10 transactions range from $562.86 to $1,684.21 across valid merchandise categories). On the log scale, the lower fence of $3.003 flags all 52 transactions sitting at the $3.00 floor as "low outliers". Neither rule should be used to drop or clip rows for downstream modeling; gradient-boosted trees are invariant to monotonic transformations, and for reporting, median ($33.82) and IQR ($43.03) should be used instead of mean and std.
 
-- **Correction**: Stage 0's draft notes 81 customers with no transaction rows as "5.4%
-  with zero rows in transactions.db." The draft itself uses the right language in one
-  place, but the model-recommendation draft slides into treating them as missing data.
-  They are not missing: they legitimately transacted zero times and are labelled
-  `churned = 1`. All 81 are churned, making up 40.1% (81 of 202) of all churners.
-  Every transaction-derived ratio feature is undefined for them; they should not be
-  treated as imputable missingness.
+- **Correction (tenure distribution and normality)**: Stage 0's draft noted `tenure_days` as "roughly symmetric (skew −0.03)" and suggested a standard t-test. Computing tenure from `customers.csv` as of 2026-08-01 yields: min 31 days, max 899 days, mean 468.6 days, median 469.0 days, and sample skewness -0.030. While skewness is close to zero, a D'Agostino-Pearson normality test yields $K^2 = 1104.96$ with $p = 1.15 \times 10^{-240}$. Tenure is essentially a uniform distribution across customer acquisition cohorts rather than a Gaussian bell curve, strongly violating the normality assumption required for Student's t-test. Non-parametric testing (Mann-Whitney U) must be used.
+
+- **Correction (zero-activity counting across data sources)**: `DATA_ISSUES_DRAFT.md` §4 noted that `transactions_monthly_agg.parquet` was extracted through 2026-07-25. We verified this by re-aggregating `transactions.db` and comparing against the parquet extract: in `transactions.db`, exactly 81 customers have zero rows (5.40% of 1,500), all 81 are churners (`churned = 1`, making up 40.10% of all 202 churners). In `transactions_monthly_agg.parquet`, exactly 91 customers appear to have zero rows. The 10 customers present in the database but missing from the parquet (who transacted between July 26 and July 31) are all retained customers (`churned = 0`). Counting zero-activity from the parquet extract would misclassify those 10 active retained customers as zero-activity, distorting the zero-activity churn rate from 100.0% down to 89.01% (81 of 91). `transactions.db` must be used.
 
 ## Hypothesis tests to run
 
+Stage 0 ran zero significance tests or p-values (§10 item 2). We recomputed each test statistic, degree of freedom, and p-value directly from `data/`:
+
 - **Driver**: `acquisition_channel`
-- **Test**: chi-square
-- **Why this test**: 4-level categorical predictor vs. binary churn outcome; no ordering
-  assumption. Overall churn by channel ranges from 10.2% (paid_search) to 15.3%
-  (organic), a gap worth testing.
+- **Test**: Chi-square test of independence
+- **Why this test & findings**: 4-level unordered categorical predictor vs binary churn outcome across 1,500 customers. Recomputed from `customers.csv`: $\chi^2 = 5.8387, df = 3, p = 0.1197$. Churn rates by channel: paid_search 10.21% (44/431), referral 13.90% (41/295), social 14.55% (24/165), organic 15.27% (93/609). Because $p > 0.05$, the observed descriptive differences are not statistically significant.
 
 - **Driver**: `region`
-- **Test**: chi-square
-- **Why this test**: 4-level unordered categorical vs. binary churn; east is highest at
-  16.4% vs. 12.3%–12.7% for the other three regions.
+- **Test**: Chi-square test of independence
+- **Why this test & findings**: 4-level categorical predictor vs binary churn outcome across 1,500 customers. Recomputed from `customers.csv`: $\chi^2 = 3.7571, df = 3, p = 0.2889$. Churn rates by region: north 12.34% (47/381), west 12.37% (47/380), south 12.71% (45/354), east 16.36% (63/385). Not statistically significant at $\alpha = 0.05$.
 
-- **Driver**: `txn_per_30d_tenure` (purchase rate normalised by tenure)
-- **Test**: Mann-Whitney U
-- **Why this test**: right-skewed continuous feature (skew 1.75 among active customers);
-  t-test normality assumption does not hold.
+- **Driver**: `txn_per_30d_tenure` (purchase rate)
+- **Test**: Mann-Whitney U test
+- **Why this test & findings**: Continuous, right-skewed feature (skew 1.75 among active customers) comparing churned vs retained active customers. Recomputed: $U = 41677.0, p = 1.25 \times 10^{-17}$. Median purchase rate for churners is 0.335 transactions per 30 days vs 0.512 for retained customers. Statistically significant; retained customers purchase at a substantially higher frequency throughout their tenure.
 
-- **Driver**: `total_spend` and `n_txn` (lifetime volume)
-- **Test**: Mann-Whitney U
-- **Why this test**: both are right-skewed (`total_spend` skew 1.03, `n_txn` skew 0.71);
-  Mann-Whitney is safer than t-test here.
+- **Driver**: `total_spend` and `n_txn` (lifetime customer volume)
+- **Test**: Mann-Whitney U test
+- **Why this test & findings**: Continuous right-skewed monetary spend (skew 1.03) and discrete count (skew 0.71). Recomputed: for `total_spend`, $U = 61626.5, p = 8.83 \times 10^{-5}$ (churn median $282.39 vs retained median $364.38); for `n_txn`, $U = 62236.5, p = 1.53 \times 10^{-4}$ (churn median 6.0 vs retained median 8.0). Both are statistically significant drivers among active customers.
 
 - **Driver**: `tenure_days`
-- **Test**: t-test (after checking normality) or Mann-Whitney U if the assumption fails
-- **Why this test**: `tenure_days` is roughly symmetric (skew −0.03) among all 1,500
-  customers, so a t-test is plausible — but the direction of the association flips
-  between all customers (shorter tenure → more churn, AUC 0.346) and active-only
-  customers (longer tenure → more churn, AUC 0.547), so the analysis must separate
-  the two populations and state which result it is reporting.
+- **Test**: Mann-Whitney U test
+- **Why this test & findings**: Bounded, non-normal uniform distribution ($p < 10^{-200}$). The relationship flips depending on population: across all 1,500 customers, churners have significantly shorter tenure ($U = 90686.0, p = 1.71 \times 10^{-12}$; churn mean 351.7 days vs retained 486.8 days) because all 81 zero-activity customers signed up recently. Among the 1,419 active customers alone, the relationship reverses ($U = 85934.5, p = 0.0859$; churn mean 528.1 days vs retained 486.8 days), which is not statistically significant at $\alpha = 0.05$.
 
-- **Driver**: `return_rate` per customer
-- **Test**: Mann-Whitney U
-- **Why this test**: zero-inflated (953 of 1,419 active customers have return_rate = 0,
-  median 0, skew ~4.1); separation in Stage 0 was near-zero (AUC 0.518–0.537), so this
-  may not be worth pursuing, but include it for completeness.
+- **Driver**: `return_rate`
+- **Test**: Mann-Whitney U test
+- **Why this test & findings**: Zero-inflated bounded ratio (953 of 1,419 active customers have return_rate = 0.0, skew 4.08). Recomputed: $U = 75246.5, p = 0.3618$. Median return rate is 0.000 for both churned and retained customers. The difference is not statistically significant; return rate should not be prioritized as a churn predictor.
 
 ## Leakage / imbalance / non-stationarity / multi-source flags
 
-- **Leakage**: `days_since_last_txn`, `txn_last_90d`, and `spend_last_90d` are all
-  circular with the churn label. The label is defined as no purchase in the trailing
-  90 days; any feature computed over that same window is not a predictor of churn —
-  it is a re-expression of the label itself. Among active customers, `days_since_last_txn`
-  achieves a single-feature ROC-AUC of 1.000 and a 90-day cutoff reproduces the churned
-  label for 100% of them — that is a sign of leakage, not a useful signal. These three
-  features must be excluded from any model-family reasoning and from the feature set
-  passed to the build stage.
+- **Leakage**: `days_since_last_txn`, `txn_last_90d`, and `spend_last_90d`. The churn label is defined in the assignment brief as having no transactions in the trailing 90 days before the as-of date (2026-08-01). Any feature calculated over that trailing 90-day window is definitionally circular with the ground truth label. In Stage 0, `days_since_last_txn` achieved a single-feature ROC-AUC of 1.000 (all 121 active churners have $\ge 91$ days recency; all 1,298 active retained customers have $\le 90$ days). This is tautological leakage that inflates validation metrics artificially. These three features must be excluded from all model training and evaluation.
 
-- **Imbalance**: overall churn rate is 13.47% (202 of 1,500); among the 1,419 active
-  customers it is 8.53% (121 of 1,419). Always predicting "not churned" achieves 86.53%
-  accuracy overall and 91.47% on active customers — accuracy is therefore not a usable
-  evaluation metric. Use PR-AUC as the primary metric; report ROC-AUC alongside, with
-  recall at a fixed precision or top-decile lift. Use stratified cross-validation and
-  class weights.
+- **Imbalance**: Overall churn rate is 13.47% (202 of 1,500); active customer churn rate is 8.53% (121 of 1,419). Naive accuracy (predicting all customers "not churned") achieves 86.53% overall and 91.47% on active customers. Accuracy is completely uninformative. Performance must be evaluated using PR-AUC (average precision), precision-recall curves, and top-decile lift, supported by stratified cross-validation and class weighting (`scale_pos_weight`).
 
-- **Non-stationarity**: monthly transaction volume rises from 1 in 2024-02 to 1,231 in
-  2026-07 (Spearman ρ = 0.998 with time), a +235% year-on-year increase. The trend is
-  not strictly monotonic (month-on-month declines in 2024-11, 2025-11, 2026-02), and
-  the customer mix shifts: the 2026 Q2 signup cohort churns at 37.4% across all customers
-  but 0% among active ones. A random customer-level train/test split could overstate
-  performance because early and late cohorts behave very differently. Prefer an out-of-time
-  check; that requires backdated label snapshots, which this pass did not build.
+- **Non-stationarity**: Monthly transaction volume expands from 1 transaction in 2024-02 to 1,231 in 2026-07 (Spearman rank correlation with time $\rho = 0.9978, p < 10^{-25}$). Year-on-year volume rose +235.4% (from 367 in 2025-07 to 1,231 in 2026-07). The upward drift is driven by customer base accumulation (signups 40–74 per month). Furthermore, churn behavior differs by cohort (e.g. 2026 Q2 signups churn at 37.4% overall vs 0.0% among active customers). A standard random train/test split would cross-contaminate cohorts; an out-of-time validation check is required.
 
-- **Multi-source**: re-aggregating `transactions.db` to customer × month and comparing
-  against `transactions_monthly_agg.parquet` month by month shows exact agreement for
-  29 of 30 months. July 2026 disagrees: the parquet has 994 transaction-count units vs.
-  1,231 in the row-level table (gap: 237 transactions, 19.3% of the month). The parquet
-  appears to have been extracted through 2026-07-25 only. As a result, 10 customers whose
-  first purchase fell in the last 6 days of July are absent from the parquet entirely,
-  all labelled `churned = 0`. Counting zero-activity from the parquet would give 91
-  instead of 81, incorrectly mixing 10 retained customers into an otherwise 100%-churned
-  group. Use `transactions.db` as the source of truth; use the parquet only for months
-  through 2026-06 where it agrees exactly.
+- **Multi-source**: Re-aggregating `transactions.db` to customer × month against `transactions_monthly_agg.parquet` confirms exact agreement for 29 of 30 months. July 2026 diverges: `transactions.db` contains 1,231 transactions, $62,084.62 total amount, and 68 returns; `transactions_monthly_agg.parquet` contains 994 transactions, $50,116.67, and 51 returns. The parquet extract is missing 237 transactions (19.25%), $11,967.95 (19.28%), and 17 returns because it was extracted on 2026-07-25. Ten customers whose first transaction occurred between July 26 and July 31 are entirely absent from the parquet file. Using the parquet would falsely count 91 zero-activity customers (diluting churn rate to 89.01%) instead of 81 (100% churn). `transactions.db` must be the sole source of truth.
 
 ## Model-family judgment
 
-- **Candidate family**: gradient-boosted decision trees (LightGBM, XGBoost, or
-  scikit-learn `HistGradientBoostingClassifier`)
-- **Why, tied to this dataset's checked characteristics**: the dataset is small (1,419
-  active customers, 121 positives) and tabular with mixed types (skewed continuous
-  features, low-cardinality categoricals). Trees are scale-invariant and robust to the
-  strong right skew in `amount` (skew 6.11), `total_spend`, and `avg_order_value`, so
-  no log transforms are required. The non-leakage continuous drivers show moderate
-  separation (purchase-rate AUC 0.735, lifetime-volume AUC ~0.60), and tenure shows a
-  non-linear direction flip between populations — a tree captures both without
-  hand-engineered interaction terms. Class weights (`scale_pos_weight`) handle the 8.53%
-  active-customer churn rate without resampling.
-- **Alternative considered**: L2-regularised logistic regression — **Why not the top
-  pick**: reaching what trees get by default would require hand-built features (log
-  transforms for skewed monetaries, binning or splines to capture threshold effects,
-  explicit interaction terms for the tenure flip); keep it as the required baseline.
-- **Drivers assumed usable**: `txn_per_30d_tenure`, `total_spend`, `n_txn`,
-  `n_categories`, `tenure_days` (with population caveat), `acquisition_channel`,
-  `region`, `dominant_category` (after fixing the tie-break rule).
-- **Drivers excluded (leakage-tainted)**: `days_since_last_txn`, `txn_last_90d`,
-  `spend_last_90d` — circular with the trailing-90-day label definition.
-- **Drivers likely to drop (near-zero separation)**: `return_rate`, `avg_order_value`,
-  channel-share features, `dominant_channel` (store-channel gap does not survive an
-  alternative tie-break rule).
+- **Candidate family**: Gradient-boosted decision trees (e.g., LightGBM, XGBoost, or scikit-learn's `HistGradientBoostingClassifier`).
+- **Why, tied to this dataset's checked characteristics**: Stage 0's draft cited the sharp 90-day recency separation to argue for tree models; that reasoning is invalid because that feature is circular leakage. However, tree ensembles remain the defensible top choice for legitimate data characteristics: the dataset is small tabular mixed-type data (1,419 active customers, 121 positives; 81 zero-activity rule-handled). Key monetary and frequency features are heavily right-skewed (`amount` skew 6.11, `total_spend` skew 1.03), and tree partitioning is invariant to monotonic transformations, eliminating the need for arbitrary log-transforms or outlier clipping. Trees naturally capture non-linear relationships (such as tenure's non-monotonic relationship with churn among active customers) without manual interaction engineering, and natively support class weighting (`scale_pos_weight`) for the 8.53% active-customer churn rate.
+- **Alternative considered**: L2-regularised logistic regression. **Why not the top pick**: Reaching comparable representation would require extensive manual feature engineering (log transforms for skewed monetaries, non-linear splines or interaction terms for tenure/cohort effects); it is retained as the required baseline that tree ensembles must outperform.
+- **Drivers assumed usable**: `txn_per_30d_tenure` (purchase rate), `total_spend`, `n_txn`, `n_categories`, `acquisition_channel`, `region`, `dominant_category` (with deterministic tie-breaking).
+- **Drivers excluded (leakage-tainted)**: `days_since_last_txn`, `txn_last_90d`, `spend_last_90d`.
+- **Drivers dropped (no signal / non-significant)**: `return_rate` ($p = 0.362$, AUC 0.52), `avg_order_value` (AUC 0.52), `dominant_channel` (tie-sensitive, non-significant).
